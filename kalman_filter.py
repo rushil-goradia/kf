@@ -3,11 +3,13 @@ import csv
 import matplotlib.pyplot as plt
 import numpy as np
 #from pykalman import KalmanFilter
+from statsmodels.tsa.stattools import adfuller
 from filterpy.kalman import KalmanFilter
 
-STOCKS = ['BAJFINANCE', 'KOTAKBANK', 'MINDTREE', 'NIFTY_50', 'NIFTY_BANK', 'RELIANCE', 'ULTRACEMCO']
-RELATIVE_PATH = "/Users/rushil.goradia/Documents/brokerage_docs/kf/samplestockindextimeseries/"
-NUM_STATES = 3
+STOCKS = ['BAJFINANCE', 'RBLBANK']
+#STOCKS = ['ONGC', 'MGL']
+RELATIVE_PATH = "/Users/rushil.goradia/Documents/brokerage_docs/kf/pair_trading/"
+NUM_STATES = 1
 
 def plot_closing_price(stock_name, stock_data):
     plt.figure()
@@ -34,11 +36,38 @@ def plot_closing_price(stock_name, stock_data):
     plt.xlabel("Days")
     #print(stock_data['residual'])
 
+def plot_pair_trade(all_stocks_data):
+    plt.figure()
+    ax1 = plt.subplot(4,1,1)
+    #print(all_stocks_data[STOCKS[1]]['log_close'][NUM_STATES:])
+    plt.plot(all_stocks_data[STOCKS[1]]['log_close'][NUM_STATES:])
+    plt.plot(all_stocks_data[STOCKS[0]]['log_close'][NUM_STATES:])
+    predicted_y = all_stocks_data['residual'] + all_stocks_data[STOCKS[0]]['log_close'][NUM_STATES:]
+    plt.plot(predicted_y)
+    plt.legend(["actual_x","actual_y", "prediction_y"])
+    plt.title("Pair trading")
+
+    ax1 = plt.subplot(4,1,2, sharex=ax1)
+    plt.plot(all_stocks_data['residual'])
+    print(adfuller(all_stocks_data['residual'][20:]))
+    plt.title("Error in kf prediction")
+    plt.xlabel("Days")
+    plt.ylabel("Log Price error (Rs)")
+    #plt.ylim([-500,500])
+
+    plt.subplot(4,1,3, sharex=ax1)
+    plt.plot(all_stocks_data['predict'][:,0])
+    plt.ylabel("Slope (beta)")
+
+    plt.subplot(4,1,4, sharex=ax1)
+    plt.plot(all_stocks_data['predict'][:,1])
+    plt.ylabel("intercept (alpha)")
     
 
 
 def get_stock_data(stock_name):
     stock_data = {}
+    stock_data['log_close'] = []
     full_path = RELATIVE_PATH + stock_name + ".csv"
     with open(full_path) as csvfile:
         csv_rows = csv.DictReader(csvfile)
@@ -54,6 +83,7 @@ def get_stock_data(stock_name):
                 value = row[key]
                 if key == 'Close':
                     value = float(value)
+                    stock_data['log_close'] += [np.log(value)]
                 stock_data[key] += [value]
                 # if ind == 0:
                 #     print(stock_data)
@@ -70,9 +100,9 @@ def kf_update(X, P, Y, H, R):
     IS = R + np.dot(H, np.dot(P, H.T))
     K = np.dot(P, np.dot(H.T, np.linalg.inv(IS)))
     X = X + np.dot(K, (Y - IM))
-    P = P - np.dot(K, np.dot(IS, K.T))
-    LH = gauss_pdf(Y, IM, IS)
-    return (X, P, K, IM, IS, LH)
+    P = P - np.dot(K, np.dot(H, P))
+    #LH = gauss_pdf(Y, IM, IS)
+    return (X, P, K, IM, IS)
 
 def gauss_pdf(X, M, S):
     if np.shape(M)[1] == 1:
@@ -93,6 +123,69 @@ def gauss_pdf(X, M, S):
         P = exp(-E)
     return (P[0],E[0]) 
 
+def run_kalman_filter_pair(stock1, stock2):
+    print(len(stock1['log_close']))
+    print(len(stock2['log_close']))
+    assert len(stock1['log_close']) == len(stock2['log_close'])
+    # x = [beta; alpha], slope and intercept
+    A = np.array([[1.0, 0.0],
+                    [0.0, 1.0]], dtype=float)
+    # measurement update matrix
+    # y[k]: Actual closing price at time k from data
+    # y[k] = H*X[k]
+    H = np.array([[1.0, 1.0]], dtype=float)
+    # Covariance of measurement noise (actual stock price)
+    R = 0.1
+    # Initial state (first 3 days price)
+    X = np.array([stock1['log_close'][0]/stock2['log_close'][0], 0.0], dtype=float).T
+    # Constantly updated covariance of state
+    P = np.array([[0.1,    0.],
+                [0., 0.01]], dtype=float)
+    # Process noise covariance (how much do you trust the model)
+    Q = np.zeros((2,2), dtype=float)
+    Q[0,0] = 0.1
+    Q[1,1] = 0.1
+    B = np.zeros((2, 1))
+    U = 0
+
+    num_measurements = len(stock1['log_close'][NUM_STATES:])
+    prediction_result = np.zeros((num_measurements,2))
+    correction_result = np.zeros((num_measurements,2))
+    kalman_gain = np.zeros((num_measurements,))
+    residual = np.zeros((num_measurements,))
+    # prediction_cov = np.zeros((num_measurements,2))
+    measurements = np.array(stock1['log_close'][NUM_STATES:])
+    H_term = np.array(stock2['log_close'][NUM_STATES:])
+    for ind, (meas, h) in enumerate(zip(measurements,H_term)):
+        #predict, gives us X[k|k-1]
+        (X, P) = kf_predict(X, P, A, Q, B, U)
+        #print(X[0])
+        
+        prediction_result[ind,0] = X[0][0]
+        prediction_result[ind,1] = X[0][1]
+        #print(kf.K)
+        #print(prediction_result[ind])
+        
+        #correct
+        Y = np.array([[meas]])
+        H[0,0] = h
+        (X, P, K, IM, IS) = kf_update(X, P, Y, H, R)
+        # X[k|k]
+        correction_result[ind,0] = X[0][0]
+        correction_result[ind,1] = X[0][1]
+
+        #debug
+        kalman_gain[ind] = np.linalg.norm(K)
+        #print(IM[0][0])
+        residual[ind] = IM[0][0] - meas
+    #print(prediction_result)
+
+    return {
+        'predict':prediction_result, 
+        'correct': correction_result,
+        'kalman_gain':kalman_gain,
+        'residual': residual,
+    }
 
 
 def run_kalman_filter(stock_name, stock_data):
@@ -142,7 +235,7 @@ def run_kalman_filter(stock_name, stock_data):
         
         #correct
         Y = np.array([[meas]])
-        (X, P, K, IM, IS, LH) = kf_update(X, P, Y, H, R)
+        (X, P, K, IM, IS) = kf_update(X, P, Y, H, R)
         # X[k|k]
         correction_result[ind] = X[0][0]
 
@@ -172,14 +265,15 @@ if __name__ == '__main__':
 
     if args.run_filter:
         for stock_name in STOCKS:
-            kf_results = run_kalman_filter(stock_name, all_stocks_data[stock_name])
+            kf_results = run_kalman_filter_pair(all_stocks_data[STOCKS[0]],all_stocks_data[STOCKS[1]])
 
-            all_stocks_data[stock_name].update(kf_results)
+            all_stocks_data.update(kf_results)
 
 
     if args.plot_all_stocks:
-        for stock_name in STOCKS:
-            plot_closing_price(stock_name, all_stocks_data[stock_name])
+        #for stock_name in STOCKS:
+            #plot_closing_price(stock_name, all_stocks_data[stock_name])
+        plot_pair_trade(all_stocks_data)
         plt.show()
             #print(all_stocks_data[stock_name]['Close'])
 
